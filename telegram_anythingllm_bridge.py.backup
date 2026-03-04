@@ -22,12 +22,8 @@ import asyncio
 import os
 import re
 import sys
-import tempfile
-import mimetypes
-from pathlib import Path
 
 import httpx
-from PIL import Image
 from telegram import BotCommand, ReplyParameters, Update
 from telegram.ext import (
     Application,
@@ -153,72 +149,6 @@ def _stop_typing(chat_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Media processing helpers
-# ---------------------------------------------------------------------------
-
-async def _download_file(file, filename_prefix: str = "media") -> Path:
-    """Download a Telegram file to a temporary location."""
-    temp_dir = Path(tempfile.gettempdir()) / "anythingllm_bridge"
-    temp_dir.mkdir(exist_ok=True)
-    
-    file_extension = Path(file.file_path).suffix if file.file_path else ""
-    temp_file = temp_dir / f"{filename_prefix}_{file.file_unique_id}{file_extension}"
-    
-    await file.download_to_drive(temp_file)
-    return temp_file
-
-
-async def _process_image(image_path: Path) -> str:
-    """Process an image and return description for AnythingLLM."""
-    try:
-        with Image.open(image_path) as img:
-            width, height = img.size
-            format_name = img.format or "Unknown"
-            
-        file_size = image_path.stat().st_size
-        return f"[Image: {format_name} {width}x{height}, {file_size//1024}KB - uploaded to workspace]"
-    except Exception as e:
-        return f"[Image uploaded - processing error: {e}]"
-
-
-async def _upload_file_to_anythingllm(file_path: Path, workspace: str) -> dict:
-    """Upload a file to AnythingLLM workspace."""
-    try:
-        url = f"{ALLM_BASE_URL}/api/v1/workspace/{workspace}/upload"
-        
-        # Prepare multipart form data
-        files = {
-            'file': (file_path.name, open(file_path, 'rb'), mimetypes.guess_type(str(file_path))[0])
-        }
-        
-        # Use httpx for multipart upload
-        async with httpx.AsyncClient(
-            headers={"Authorization": f"Bearer {ALLM_API_KEY}"},
-            timeout=60.0
-        ) as client:
-            response = await client.post(url, files=files)
-            
-        files['file'][1].close()  # Close the file handle
-        
-        if response.is_success:
-            return response.json()
-        else:
-            return {"error": f"Upload failed: {response.status_code} - {response.text[:200]}"}
-            
-    except Exception as e:
-        return {"error": f"Upload exception: {e}"}
-
-
-async def _cleanup_temp_file(file_path: Path) -> None:
-    """Clean up temporary file."""
-    try:
-        if file_path.exists():
-            file_path.unlink()
-    except Exception as e:
-        print(f"[WARN] Failed to cleanup {file_path}: {e}", file=sys.stderr)
-
-
-# ---------------------------------------------------------------------------
 # AnythingLLM API
 # ---------------------------------------------------------------------------
 
@@ -307,11 +237,8 @@ async def _on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     name = update.effective_user.first_name
     await update.message.reply_text(
-        f"👋 Hi {name}! I'm connected to AnythingLLM workspace '{ALLM_WORKSPACE}'.\n\n"
-        "💬 Send me text messages and I'll forward them to the agent.\n"
-        "📷 Send photos and I'll upload them to the workspace for analysis.\n"
-        "🎵 Send audio/voice messages and I'll upload them for processing.\n"
-        "📄 Send documents and I'll add them to the workspace.\n\n"
+        f"👋 Hi {name}! I'm connected to AnythingLLM workspace '{ALLM_WORKSPACE}'.\n"
+        "Send me a message and I'll forward it to the agent.\n"
         "/new — reset conversation thread\n"
         "/help — show this message"
     )
@@ -322,10 +249,6 @@ async def _on_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(
         f"🔗 AnythingLLM Bridge → workspace '{ALLM_WORKSPACE}'\n\n"
-        "💬 Text messages - forwarded to agent\n"
-        "📷 Photos - uploaded and analyzed\n" 
-        "🎵 Audio/Voice - uploaded for processing\n"
-        "📄 Documents - added to workspace\n\n"
         "/new — start a new conversation thread\n"
         "/help — show this message"
     )
@@ -358,73 +281,17 @@ async def _on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if message.caption:
         content_parts.append(message.caption)
 
-    # Handle media files - download and upload to AnythingLLM
-    temp_files = []  # Track temp files for cleanup
-    
-    try:
-        # Handle photos
-        if message.photo:
-            photo_file = await message.photo[-1].get_file()  # Get highest resolution
-            temp_path = await _download_file(photo_file, "photo")
-            temp_files.append(temp_path)
-            
-            # Upload to AnythingLLM
-            upload_result = await _upload_file_to_anythingllm(temp_path, ALLM_WORKSPACE)
-            if "error" in upload_result:
-                content_parts.append(f"⚠️ Photo upload failed: {upload_result['error']}")
-            else:
-                image_description = await _process_image(temp_path)
-                content_parts.append(image_description)
-        
-        # Handle audio/voice messages  
-        if message.voice:
-            voice_file = await message.voice.get_file()
-            temp_path = await _download_file(voice_file, "voice")
-            temp_files.append(temp_path)
-            
-            upload_result = await _upload_file_to_anythingllm(temp_path, ALLM_WORKSPACE)
-            if "error" in upload_result:
-                content_parts.append(f"⚠️ Voice upload failed: {upload_result['error']}")
-            else:
-                duration = message.voice.duration
-                file_size = temp_path.stat().st_size
-                content_parts.append(f"[Voice message: {duration}s, {file_size//1024}KB - uploaded to workspace]")
-                
-        if message.audio:
-            audio_file = await message.audio.get_file()
-            temp_path = await _download_file(audio_file, "audio")
-            temp_files.append(temp_path)
-            
-            upload_result = await _upload_file_to_anythingllm(temp_path, ALLM_WORKSPACE)
-            if "error" in upload_result:
-                content_parts.append(f"⚠️ Audio upload failed: {upload_result['error']}")
-            else:
-                duration = getattr(message.audio, 'duration', 0)
-                title = getattr(message.audio, 'title', 'Unknown')
-                content_parts.append(f"[Audio: {title}, {duration}s - uploaded to workspace]")
-        
-        # Handle documents
-        if message.document:
-            doc_file = await message.document.get_file()
-            temp_path = await _download_file(doc_file, "document")
-            temp_files.append(temp_path)
-            
-            upload_result = await _upload_file_to_anythingllm(temp_path, ALLM_WORKSPACE)
-            if "error" in upload_result:
-                content_parts.append(f"⚠️ Document upload failed: {upload_result['error']}")
-            else:
-                file_size = temp_path.stat().st_size
-                content_parts.append(f"[Document: {message.document.file_name}, {file_size//1024}KB - uploaded to workspace]")
-                
-    except Exception as e:
-        content_parts.append(f"⚠️ Media processing error: {e}")
-        print(f"[ERROR] Media processing failed: {e}", file=sys.stderr)
+    # Note: media (photos, voice, docs) could be handled here with download +
+    # upload to AnythingLLM, but keeping v1 text-only for simplicity.
+    if message.photo:
+        content_parts.append("[image attached — not yet supported by bridge]")
+    if message.voice or message.audio:
+        content_parts.append("[audio attached — not yet supported by bridge]")
+    if message.document:
+        content_parts.append("[document attached — not yet supported by bridge]")
 
     content = "\n".join(content_parts) if content_parts else ""
     if not content.strip():
-        # Clean up any temp files even if no content
-        for temp_file in temp_files:
-            await _cleanup_temp_file(temp_file)
         return
 
     # Show typing while we wait for AnythingLLM
@@ -437,10 +304,6 @@ async def _on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         _stop_typing(chat_id)
         await _send_reply(ctx.bot, chat_id, f"⚠️ Error: {e}", reply_to=message.message_id)
-    finally:
-        # Clean up temporary files
-        for temp_file in temp_files:
-            await _cleanup_temp_file(temp_file)
 
 
 async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
