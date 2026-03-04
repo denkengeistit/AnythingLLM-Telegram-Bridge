@@ -13,6 +13,9 @@ Usage:
     export ANYTHINGLLM_BASE_URL="http://localhost:3001"   # optional
     export ANYTHINGLLM_WORKSPACE="your-workspace-slug"    # optional, default: "nanobot"
     export ALLOWED_USER_IDS="*"                           # optional, * = allow all
+    export AGENT_PREFIX="true"                            # optional, enable @agent prefix
+    export AGENT_FOR_TEXT="true"                          # optional, use @agent for text messages
+    export AGENT_FOR_IMAGES="false"                       # optional, use @agent for image messages
     python scripts/telegram_anythingllm_bridge.py
 """
 
@@ -48,7 +51,11 @@ ALLM_BASE_URL = os.environ.get("ANYTHINGLLM_BASE_URL", "http://localhost:3001").
 ALLM_API_KEY = os.environ.get("ANYTHINGLLM_API_KEY", "")
 ALLM_WORKSPACE = os.environ.get("ANYTHINGLLM_WORKSPACE", "nanobot")
 ALLOWED_IDS = os.environ.get("ALLOWED_USER_IDS", "*")  # comma-separated or "*"
+
+# Agent mode configuration
 AGENT_PREFIX = os.environ.get("AGENT_PREFIX", "true").lower() in ("1", "true", "yes")
+AGENT_FOR_IMAGES = os.environ.get("AGENT_FOR_IMAGES", "false").lower() in ("1", "true", "yes")
+AGENT_FOR_TEXT = os.environ.get("AGENT_FOR_TEXT", "true").lower() in ("1", "true", "yes")
 
 # Per-chat thread tracking: chat_id -> AnythingLLM threadSlug
 _chat_threads: dict[int, str | None] = {}
@@ -241,9 +248,15 @@ async def _chat_anythingllm(message: str, chat_id: int, mode: str = "chat", atta
     if thread_slug:
         body["threadSlug"] = thread_slug
 
-    # Prefix with @agent to activate agent skills
+    # Smart @agent prefix logic:
+    # - For images: use @agent only if AGENT_FOR_IMAGES is enabled
+    # - For text: use @agent only if AGENT_FOR_TEXT is enabled
+    # - Overall controlled by AGENT_PREFIX master switch
     if AGENT_PREFIX:
-        body["message"] = f"@agent {message}"
+        if attachments and AGENT_FOR_IMAGES:
+            body["message"] = f"@agent {message}"
+        elif not attachments and AGENT_FOR_TEXT:
+            body["message"] = f"@agent {message}"
 
     try:
         url = f"{ALLM_BASE_URL}/api/v1/workspace/{ALLM_WORKSPACE}/chat"
@@ -433,7 +446,15 @@ async def main() -> None:
         sys.exit("ANYTHINGLLM_API_KEY not set")
 
     print(f"Bridge: Telegram → AnythingLLM ({ALLM_BASE_URL}/workspace/{ALLM_WORKSPACE})")
-    print(f"Agent prefix: {'@agent ' if AGENT_PREFIX else 'disabled'}")
+    if AGENT_PREFIX:
+        agent_mode = []
+        if AGENT_FOR_TEXT:
+            agent_mode.append("text")
+        if AGENT_FOR_IMAGES:
+            agent_mode.append("images")
+        print(f"Agent mode: @agent for {' + '.join(agent_mode) if agent_mode else 'nothing'}")
+    else:
+        print(f"Agent mode: disabled")
     print(f"Allowed users: {ALLOWED_IDS}")
 
     req = HTTPXRequest(connection_pool_size=16, pool_timeout=5.0, connect_timeout=30.0, read_timeout=30.0)
