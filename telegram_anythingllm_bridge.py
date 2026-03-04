@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import re
 import sys
@@ -181,32 +182,28 @@ async def _process_image(image_path: Path) -> str:
         return f"[Image uploaded - processing error: {e}]"
 
 
-async def _upload_file_to_anythingllm(file_path: Path, workspace: str) -> dict:
-    """Upload a file to AnythingLLM workspace."""
+async def _create_image_attachment(file_path: Path) -> dict:
+    """Create an attachment object for AnythingLLM chat from an image file."""
     try:
-        url = f"{ALLM_BASE_URL}/api/v1/workspace/{workspace}/upload"
+        # Read and encode image as base64
+        with open(file_path, 'rb') as f:
+            image_data = f.read()
+            base64_image = base64.b64encode(image_data).decode('utf-8')
         
-        # Prepare multipart form data
-        files = {
-            'file': (file_path.name, open(file_path, 'rb'), mimetypes.guess_type(str(file_path))[0])
+        # Determine mime type
+        mime_type = mimetypes.guess_type(str(file_path))[0] or 'image/png'
+        
+        # Create attachment in the format AnythingLLM expects
+        attachment = {
+            "type": "image",
+            "data": f"data:{mime_type};base64,{base64_image}",
+            "name": file_path.name
         }
         
-        # Use httpx for multipart upload
-        async with httpx.AsyncClient(
-            headers={"Authorization": f"Bearer {ALLM_API_KEY}"},
-            timeout=60.0
-        ) as client:
-            response = await client.post(url, files=files)
-            
-        files['file'][1].close()  # Close the file handle
+        return {"attachment": attachment}
         
-        if response.is_success:
-            return response.json()
-        else:
-            return {"error": f"Upload failed: {response.status_code} - {response.text[:200]}"}
-            
     except Exception as e:
-        return {"error": f"Upload exception: {e}"}
+        return {"error": f"Failed to create attachment: {e}"}
 
 
 async def _cleanup_temp_file(file_path: Path) -> None:
@@ -231,9 +228,13 @@ _http = httpx.AsyncClient(
 )
 
 
-async def _chat_anythingllm(message: str, chat_id: int, mode: str = "chat") -> str:
+async def _chat_anythingllm(message: str, chat_id: int, mode: str = "chat", attachments: list = None) -> str:
     """Send a message to AnythingLLM and return the text response."""
     body: dict = {"message": message, "mode": mode}
+
+    # Add attachments if provided
+    if attachments:
+        body["attachments"] = attachments
 
     # Reuse thread if we have one for this chat
     thread_slug = _chat_threads.get(chat_id)
@@ -309,9 +310,9 @@ async def _on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"👋 Hi {name}! I'm connected to AnythingLLM workspace '{ALLM_WORKSPACE}'.\n\n"
         "💬 Send me text messages and I'll forward them to the agent.\n"
-        "📷 Send photos and I'll upload them to the workspace for analysis.\n"
-        "🎵 Send audio/voice messages and I'll upload them for processing.\n"
-        "📄 Send documents and I'll add them to the workspace.\n\n"
+        "📷 Send photos and I'll analyze them with vision AI.\n"
+        "🎵 Audio/voice: coming soon\n"
+        "📄 Documents: coming soon\n\n"
         "/new — reset conversation thread\n"
         "/help — show this message"
     )
@@ -323,9 +324,9 @@ async def _on_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"🔗 AnythingLLM Bridge → workspace '{ALLM_WORKSPACE}'\n\n"
         "💬 Text messages - forwarded to agent\n"
-        "📷 Photos - uploaded and analyzed\n" 
-        "🎵 Audio/Voice - uploaded for processing\n"
-        "📄 Documents - added to workspace\n\n"
+        "📷 Photos - analyzed with vision AI\n" 
+        "🎵 Audio/Voice - coming soon\n"
+        "📄 Documents - coming soon\n\n"
         "/new — start a new conversation thread\n"
         "/help — show this message"
     )
@@ -358,8 +359,9 @@ async def _on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if message.caption:
         content_parts.append(message.caption)
 
-    # Handle media files - download and upload to AnythingLLM
+    # Handle media files - prepare attachments
     temp_files = []  # Track temp files for cleanup
+    attachments = []  # Track attachments for chat
     
     try:
         # Handle photos
@@ -368,53 +370,26 @@ async def _on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             temp_path = await _download_file(photo_file, "photo")
             temp_files.append(temp_path)
             
-            # Upload to AnythingLLM
-            upload_result = await _upload_file_to_anythingllm(temp_path, ALLM_WORKSPACE)
-            if "error" in upload_result:
-                content_parts.append(f"⚠️ Photo upload failed: {upload_result['error']}")
+            # Create attachment for AnythingLLM
+            attachment_result = await _create_image_attachment(temp_path)
+            if "error" in attachment_result:
+                content_parts.append(f"⚠️ Photo processing failed: {attachment_result['error']}")
             else:
+                attachments.append(attachment_result["attachment"])
                 image_description = await _process_image(temp_path)
                 content_parts.append(image_description)
         
-        # Handle audio/voice messages  
+        # Note: Audio/voice/document uploads not supported yet with chat attachments
+        # Only images are supported in the current AnythingLLM chat attachment format
         if message.voice:
-            voice_file = await message.voice.get_file()
-            temp_path = await _download_file(voice_file, "voice")
-            temp_files.append(temp_path)
-            
-            upload_result = await _upload_file_to_anythingllm(temp_path, ALLM_WORKSPACE)
-            if "error" in upload_result:
-                content_parts.append(f"⚠️ Voice upload failed: {upload_result['error']}")
-            else:
-                duration = message.voice.duration
-                file_size = temp_path.stat().st_size
-                content_parts.append(f"[Voice message: {duration}s, {file_size//1024}KB - uploaded to workspace]")
+            content_parts.append("🎵 Voice message received (audio processing not yet implemented)")
                 
         if message.audio:
-            audio_file = await message.audio.get_file()
-            temp_path = await _download_file(audio_file, "audio")
-            temp_files.append(temp_path)
-            
-            upload_result = await _upload_file_to_anythingllm(temp_path, ALLM_WORKSPACE)
-            if "error" in upload_result:
-                content_parts.append(f"⚠️ Audio upload failed: {upload_result['error']}")
-            else:
-                duration = getattr(message.audio, 'duration', 0)
-                title = getattr(message.audio, 'title', 'Unknown')
-                content_parts.append(f"[Audio: {title}, {duration}s - uploaded to workspace]")
+            title = getattr(message.audio, 'title', 'Unknown')
+            content_parts.append(f"🎵 Audio file '{title}' received (audio processing not yet implemented)")
         
-        # Handle documents
         if message.document:
-            doc_file = await message.document.get_file()
-            temp_path = await _download_file(doc_file, "document")
-            temp_files.append(temp_path)
-            
-            upload_result = await _upload_file_to_anythingllm(temp_path, ALLM_WORKSPACE)
-            if "error" in upload_result:
-                content_parts.append(f"⚠️ Document upload failed: {upload_result['error']}")
-            else:
-                file_size = temp_path.stat().st_size
-                content_parts.append(f"[Document: {message.document.file_name}, {file_size//1024}KB - uploaded to workspace]")
+            content_parts.append(f"📄 Document '{message.document.file_name}' received (document processing not yet implemented)")
                 
     except Exception as e:
         content_parts.append(f"⚠️ Media processing error: {e}")
@@ -431,7 +406,7 @@ async def _on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     _start_typing(ctx.bot, chat_id)
 
     try:
-        response = await _chat_anythingllm(content, chat_id)
+        response = await _chat_anythingllm(content, chat_id, attachments=attachments)
         _stop_typing(chat_id)
         await _send_reply(ctx.bot, chat_id, response, reply_to=message.message_id)
     except Exception as e:
