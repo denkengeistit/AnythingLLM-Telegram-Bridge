@@ -12,7 +12,7 @@ Usage:
     export ANYTHINGLLM_API_KEY="..."
     export ANYTHINGLLM_BASE_URL="http://localhost:3001"   # optional
     export ANYTHINGLLM_WORKSPACE="your-workspace-slug"    # optional, default: "nanobot"
-    export ALLOWED_USER_IDS="*"                           # optional, * = allow all
+    export ALLOWED_USER_IDS=""                            # required: comma-separated user IDs/usernames
     export AGENT_PREFIX="true"                            # optional, enable @agent prefix
     export AGENT_FOR_TEXT="true"                          # optional, use @agent for text messages
     export AGENT_FOR_IMAGES="false"                       # optional, use @agent for image messages
@@ -22,16 +22,14 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 import re
+import subprocess
 import sys
-import tempfile
-import mimetypes
+from datetime import datetime
 from pathlib import Path
 
 import httpx
-from PIL import Image
 from telegram import BotCommand, ReplyParameters, Update
 from telegram.ext import (
     Application,
@@ -50,12 +48,16 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLM_BASE_URL = os.environ.get("ANYTHINGLLM_BASE_URL", "http://localhost:3001").rstrip("/")
 ALLM_API_KEY = os.environ.get("ANYTHINGLLM_API_KEY", "")
 ALLM_WORKSPACE = os.environ.get("ANYTHINGLLM_WORKSPACE", "nanobot")
-ALLOWED_IDS = os.environ.get("ALLOWED_USER_IDS", "*")  # comma-separated or "*"
+ALLOWED_IDS = os.environ.get("ALLOWED_USER_IDS", "")  # comma-separated user IDs/usernames (required)
 
 # Agent mode configuration
 AGENT_PREFIX = os.environ.get("AGENT_PREFIX", "true").lower() in ("1", "true", "yes")
 AGENT_FOR_IMAGES = os.environ.get("AGENT_FOR_IMAGES", "false").lower() in ("1", "true", "yes")
 AGENT_FOR_TEXT = os.environ.get("AGENT_FOR_TEXT", "true").lower() in ("1", "true", "yes")
+
+# Image download settings
+DOWNLOAD_DIR = Path.home() / "Downloads" / "Telegram_Images"
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Per-chat thread tracking: chat_id -> AnythingLLM threadSlug
 _chat_threads: dict[int, str | None] = {}
@@ -161,65 +163,54 @@ def _stop_typing(chat_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Media processing helpers
+# Image handling (download + shortcut approach)
 # ---------------------------------------------------------------------------
 
-async def _download_file(file, filename_prefix: str = "media") -> Path:
-    """Download a Telegram file to a temporary location."""
-    temp_dir = Path(tempfile.gettempdir()) / "anythingllm_bridge"
-    temp_dir.mkdir(exist_ok=True)
-    
-    file_extension = Path(file.file_path).suffix if file.file_path else ""
-    temp_file = temp_dir / f"{filename_prefix}_{file.file_unique_id}{file_extension}"
-    
-    await file.download_to_drive(temp_file)
-    return temp_file
-
-
-async def _process_image(image_path: Path) -> str:
-    """Process an image and return description for AnythingLLM."""
+async def _download_and_open_image(file, caption: str = "") -> str:
+    """Download image and open it with AnythingLLM shortcut"""
     try:
-        with Image.open(image_path) as img:
-            width, height = img.size
-            format_name = img.format or "Unknown"
-            
-        file_size = image_path.stat().st_size
-        return f"[Image: {format_name} {width}x{height}, {file_size//1024}KB - uploaded to workspace]"
-    except Exception as e:
-        return f"[Image uploaded - processing error: {e}]"
-
-
-async def _create_image_attachment(file_path: Path) -> dict:
-    """Create an attachment object for AnythingLLM chat from an image file."""
-    try:
-        # Read and encode image as base64
-        with open(file_path, 'rb') as f:
-            image_data = f.read()
-            base64_image = base64.b64encode(image_data).decode('utf-8')
+        # Create filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_extension = Path(file.file_path).suffix if file.file_path else ".png"
         
-        # Determine mime type
-        mime_type = mimetypes.guess_type(str(file_path))[0] or 'image/png'
+        # Clean caption for filename (optional)
+        safe_caption = ""
+        if caption:
+            safe_caption = "".join(c for c in caption[:30] if c.isalnum() or c in (' ', '-', '_')).strip()
+            safe_caption = f"_{safe_caption}" if safe_caption else ""
         
-        # Create attachment in the format AnythingLLM expects
-        attachment = {
-            "type": "image",
-            "data": f"data:{mime_type};base64,{base64_image}",
-            "name": file_path.name
-        }
+        filename = f"telegram_image_{timestamp}{safe_caption}{file_extension}"
+        local_path = DOWNLOAD_DIR / filename
         
-        return {"attachment": attachment}
+        # Download the file
+        await file.download_to_drive(local_path)
+        
+        # Open the image
+        if sys.platform == "darwin":  # macOS
+            subprocess.run(["open", str(local_path)])
+        elif sys.platform == "win32":  # Windows
+            os.startfile(str(local_path))
+        else:  # Linux
+            subprocess.run(["xdg-open", str(local_path)])
+        
+        # Wait a moment for the image to open, then trigger the shortcut
+        if sys.platform == "darwin":  # macOS only
+            import time
+            time.sleep(1)  # Give the image time to open
+            try:
+                # Just run the shortcut - it handles everything internally
+                subprocess.run(["shortcuts", "run", "AnythingLLM Screenshot"], check=True)
+                time.sleep(3)  # Give the screenshot process time to complete
+                # Second trigger - reset the toggle for next time
+                subprocess.run(["shortcuts", "run", "AnythingLLM Screenshot"], check=True)
+                return f"✅ Image opened and analyzed with AnythingLLM!\n📁 {local_path.name}\n🤖 Screenshot taken and toggle reset"
+            except subprocess.CalledProcessError as e:
+                return f"✅ Image opened but shortcut failed!\n📁 {local_path.name}\n❌ Shortcut error: {e}"
+        
+        return f"✅ Image saved and opened!\n📁 {local_path.name}\n💡 Drag it into AnythingLLM desktop for analysis"
         
     except Exception as e:
-        return {"error": f"Failed to create attachment: {e}"}
-
-
-async def _cleanup_temp_file(file_path: Path) -> None:
-    """Clean up temporary file."""
-    try:
-        if file_path.exists():
-            file_path.unlink()
-    except Exception as e:
-        print(f"[WARN] Failed to cleanup {file_path}: {e}", file=sys.stderr)
+        return f"❌ Failed to download image: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -235,28 +226,18 @@ _http = httpx.AsyncClient(
 )
 
 
-async def _chat_anythingllm(message: str, chat_id: int, mode: str = "chat", attachments: list = None) -> str:
+async def _chat_anythingllm(message: str, chat_id: int, mode: str = "chat") -> str:
     """Send a message to AnythingLLM and return the text response."""
     body: dict = {"message": message, "mode": mode}
-
-    # Add attachments if provided
-    if attachments:
-        body["attachments"] = attachments
 
     # Reuse thread if we have one for this chat
     thread_slug = _chat_threads.get(chat_id)
     if thread_slug:
         body["threadSlug"] = thread_slug
 
-    # Smart @agent prefix logic:
-    # - For images: use @agent only if AGENT_FOR_IMAGES is enabled
-    # - For text: use @agent only if AGENT_FOR_TEXT is enabled
-    # - Overall controlled by AGENT_PREFIX master switch
-    if AGENT_PREFIX:
-        if attachments and AGENT_FOR_IMAGES:
-            body["message"] = f"@agent {message}"
-        elif not attachments and AGENT_FOR_TEXT:
-            body["message"] = f"@agent {message}"
+    # Prefix with @agent to activate agent skills (for text messages)
+    if AGENT_PREFIX and AGENT_FOR_TEXT:
+        body["message"] = f"@agent {message}"
 
     try:
         url = f"{ALLM_BASE_URL}/api/v1/workspace/{ALLM_WORKSPACE}/chat"
@@ -321,13 +302,12 @@ async def _on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     name = update.effective_user.first_name
     await update.message.reply_text(
-        f"👋 Hi {name}! I'm connected to AnythingLLM workspace '{ALLM_WORKSPACE}'.\n\n"
-        "💬 Send me text messages and I'll forward them to the agent.\n"
-        "📷 Send photos and I'll analyze them with vision AI.\n"
-        "🎵 Audio/voice: coming soon\n"
-        "📄 Documents: coming soon\n\n"
-        "/new — reset conversation thread\n"
-        "/help — show this message"
+        f"👋 Hi {name}! I'm your combined Telegram bridge.\n\n"
+        f"💬 Text messages → AnythingLLM workspace '{ALLM_WORKSPACE}'\n"
+        f"📷 Images → Download & trigger AnythingLLM desktop\n"
+        f"📁 Download folder: {DOWNLOAD_DIR}\n\n"
+        f"/new — reset conversation thread\n"
+        f"/help — show this message"
     )
 
 
@@ -335,13 +315,12 @@ async def _on_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
     await update.message.reply_text(
-        f"🔗 AnythingLLM Bridge → workspace '{ALLM_WORKSPACE}'\n\n"
-        "💬 Text messages - forwarded to agent\n"
-        "📷 Photos - analyzed with vision AI\n" 
-        "🎵 Audio/Voice - coming soon\n"
-        "📄 Documents - coming soon\n\n"
-        "/new — start a new conversation thread\n"
-        "/help — show this message"
+        f"🔗 Combined AnythingLLM Bridge\n\n"
+        f"💬 Text → AnythingLLM API (workspace '{ALLM_WORKSPACE}')\n"
+        f"📷 Images → Local download + desktop shortcut\n"
+        f"📁 Images saved to: {DOWNLOAD_DIR}\n\n"
+        f"/new — start a new conversation thread\n"
+        f"/help — show this message"
     )
 
 
@@ -365,70 +344,59 @@ async def _on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text("⛔ Access denied. Your user ID is not in the allow list.")
         return
 
-    # Build content
+    # Handle images first - download and trigger shortcut
+    if message.photo:
+        # Get highest resolution photo
+        photo_file = await message.photo[-1].get_file()
+        caption = message.caption or ""
+        
+        # Show processing message
+        processing_msg = await message.reply_text("📥 Downloading image...")
+        
+        # Download and open with shortcut
+        result = await _download_and_open_image(photo_file, caption)
+        
+        # Update the message
+        await processing_msg.edit_text(result)
+        return
+        
+    elif message.document and message.document.mime_type and message.document.mime_type.startswith('image/'):
+        # Handle image documents
+        doc_file = await message.document.get_file()
+        caption = message.caption or ""
+        
+        processing_msg = await message.reply_text("📥 Downloading image document...")
+        result = await _download_and_open_image(doc_file, caption)
+        await processing_msg.edit_text(result)
+        return
+
+    # Handle text messages - forward to AnythingLLM API
     content_parts = []
     if message.text:
         content_parts.append(message.text)
     if message.caption:
         content_parts.append(message.caption)
 
-    # Handle media files - prepare attachments
-    temp_files = []  # Track temp files for cleanup
-    attachments = []  # Track attachments for chat
-    
-    try:
-        # Handle photos
-        if message.photo:
-            photo_file = await message.photo[-1].get_file()  # Get highest resolution
-            temp_path = await _download_file(photo_file, "photo")
-            temp_files.append(temp_path)
-            
-            # Create attachment for AnythingLLM
-            attachment_result = await _create_image_attachment(temp_path)
-            if "error" in attachment_result:
-                content_parts.append(f"⚠️ Photo processing failed: {attachment_result['error']}")
-            else:
-                attachments.append(attachment_result["attachment"])
-                image_description = await _process_image(temp_path)
-                content_parts.append(image_description)
-        
-        # Note: Audio/voice/document uploads not supported yet with chat attachments
-        # Only images are supported in the current AnythingLLM chat attachment format
-        if message.voice:
-            content_parts.append("🎵 Voice message received (audio processing not yet implemented)")
-                
-        if message.audio:
-            title = getattr(message.audio, 'title', 'Unknown')
-            content_parts.append(f"🎵 Audio file '{title}' received (audio processing not yet implemented)")
-        
-        if message.document:
-            content_parts.append(f"📄 Document '{message.document.file_name}' received (document processing not yet implemented)")
-                
-    except Exception as e:
-        content_parts.append(f"⚠️ Media processing error: {e}")
-        print(f"[ERROR] Media processing failed: {e}", file=sys.stderr)
+    # Note media attachments for context
+    if message.voice or message.audio:
+        content_parts.append("[audio attached — not yet supported by API bridge]")
+    if message.document and not (message.document.mime_type and message.document.mime_type.startswith('image/')):
+        content_parts.append("[document attached — not yet supported by API bridge]")
 
     content = "\n".join(content_parts) if content_parts else ""
     if not content.strip():
-        # Clean up any temp files even if no content
-        for temp_file in temp_files:
-            await _cleanup_temp_file(temp_file)
         return
 
     # Show typing while we wait for AnythingLLM
     _start_typing(ctx.bot, chat_id)
 
     try:
-        response = await _chat_anythingllm(content, chat_id, attachments=attachments)
+        response = await _chat_anythingllm(content, chat_id)
         _stop_typing(chat_id)
         await _send_reply(ctx.bot, chat_id, response, reply_to=message.message_id)
     except Exception as e:
         _stop_typing(chat_id)
         await _send_reply(ctx.bot, chat_id, f"⚠️ Error: {e}", reply_to=message.message_id)
-    finally:
-        # Clean up temporary files
-        for temp_file in temp_files:
-            await _cleanup_temp_file(temp_file)
 
 
 async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -444,8 +412,12 @@ async def main() -> None:
         sys.exit("TELEGRAM_BOT_TOKEN not set")
     if not ALLM_API_KEY:
         sys.exit("ANYTHINGLLM_API_KEY not set")
+    if not ALLOWED_IDS.strip():
+        sys.exit("ALLOWED_USER_IDS not set - you must explicitly specify allowed Telegram user IDs or usernames")
 
-    print(f"Bridge: Telegram → AnythingLLM ({ALLM_BASE_URL}/workspace/{ALLM_WORKSPACE})")
+    print(f"🔗 Combined Telegram ↔ AnythingLLM Bridge")
+    print(f"💬 Text API: {ALLM_BASE_URL}/workspace/{ALLM_WORKSPACE}")
+    print(f"📷 Image downloads: {DOWNLOAD_DIR}")
     if AGENT_PREFIX:
         agent_mode = []
         if AGENT_FOR_TEXT:

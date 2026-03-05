@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "telegram-file-receiver": {
+      "command": "python3.11",
+      "args": [
+        "/Users/andme/Sync/Projects/nanobot/AnythingLLM-Telegram-Bridge/telegram_mcp_simple.py"
+      ],
+      "env": {
+        "TELEGRAM_BOT_TOKEN": "8452801263:AAEbkwvbwoqaFXUkm9H0aoU-jeWFwtjSwhg",
+        "ALLOWED_USER_IDS": "*"
+      }
+    }
+  }
+}
