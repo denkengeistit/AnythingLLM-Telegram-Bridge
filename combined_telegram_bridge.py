@@ -246,6 +246,10 @@ async def _download_and_open_image(file, caption: str = "") -> str:
             import time
             time.sleep(1)  # Give the image time to open
             try:
+                # Activate AnythingLLM first to ensure assistant window is available
+                subprocess.run(["osascript", "-e", "tell application \"AnythingLLM\" to activate"], check=True)
+                time.sleep(1)  # Give time for activation
+                
                 # First trigger - activate the screenshot
                 subprocess.run(["shortcuts", "run", "AnythingLLM Screenshot"], check=True)
                 time.sleep(3)  # Give the screenshot process time to complete
