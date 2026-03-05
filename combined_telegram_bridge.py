@@ -166,7 +166,7 @@ _http = httpx.AsyncClient(
         "Authorization": f"Bearer {ALLM_API_KEY}",
         "Content-Type": "application/json",
     },
-    timeout=120.0,
+    timeout=180.0,
 )
 
 
