@@ -193,21 +193,14 @@ async def _download_and_open_image(file, caption: str = "") -> str:
         else:  # Linux
             subprocess.run(["xdg-open", str(local_path)])
         
-        # Wait a moment for the image to open, then trigger the shortcut
-        if sys.platform == "darwin":  # macOS only
+        # Wait a moment for the image to open, then run the AppleScript directly
+        if sys.platform == "darwin":
             import time
             time.sleep(1)  # Give the image time to open
-            try:
-                # Just run the shortcut - it handles everything internally
-                subprocess.run(["shortcuts", "run", "AnythingLLM Screenshot"], check=True)
-                time.sleep(3)  # Give the screenshot process time to complete
-                # Second trigger - reset the toggle for next time
-                subprocess.run(["shortcuts", "run", "AnythingLLM Screenshot"], check=True)
-                return f"✅ Image opened and analyzed with AnythingLLM!\n📁 {local_path.name}\n🤖 Screenshot taken and toggle reset"
-            except subprocess.CalledProcessError as e:
-                return f"✅ Image opened but shortcut failed!\n📁 {local_path.name}\n❌ Shortcut error: {e}"
+            subprocess.run(["osascript", "/Users/andme/Sync/Projects/anythingllm_screenshot.scpt"])
+            return f"✅ Image sent to AnythingLLM!\n📁 {local_path.name}"
         
-        return f"✅ Image saved and opened!\n📁 {local_path.name}\n💡 Drag it into AnythingLLM desktop for analysis"
+        return f"✅ Image saved and opened!\n📁 {local_path.name}"
         
     except Exception as e:
         return f"❌ Failed to download image: {e}"
@@ -256,7 +249,11 @@ async def _chat_anythingllm(message: str, chat_id: int, mode: str = "chat") -> s
         # Extract response text
         for key in ("textResponse", "response", "content"):
             if key in data and data[key]:
-                return data[key]
+                text = data[key]
+                # Strip LLM processing tags that leak through
+                text = re.sub(r'<\|begin_of_box\|>', '', text)
+                text = re.sub(r'<\|end_of_box\|>', '', text)
+                return text.strip()
 
         return str(data)
 
